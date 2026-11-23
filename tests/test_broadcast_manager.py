@@ -1,34 +1,36 @@
 """Tests for backend/app/services/broadcast_manager.py."""
 
 import asyncio
-import json
 from datetime import UTC, datetime
 
-from app.services import broadcast_manager
 from app.services.broadcast_manager import ConnectionManager
 from app.services.data_manager import DataManager
 
 
-class FakeConnection:
-    def __init__(self, messages=()):
-        self.messages = list(messages)
+class FakeWebSocket:
+    def __init__(self, fail=False):
         self.sent = []
+        self.fail = fail
 
-    def __aiter__(self):
-        return self
+    async def send_json(self, message):
+        if self.fail:
+            raise OSError("connection closed")
+        self.sent.append(message)
 
-    async def __anext__(self):
-        if not self.messages:
-            raise StopAsyncIteration
-        return self.messages.pop(0)
+    async def send_text(self, message):
+        if self.fail:
+            raise OSError("connection closed")
+        self.sent.append(message)
 
-    async def send(self, message):
+    async def send_bytes(self, message):
+        if self.fail:
+            raise OSError("connection closed")
         self.sent.append(message)
 
 
 def test_register_and_unregister_connection():
     manager = ConnectionManager()
-    connection = FakeConnection()
+    connection = FakeWebSocket()
 
     manager.register(connection)
     assert connection in manager.active_connections
@@ -40,103 +42,85 @@ def test_register_and_unregister_connection():
 def test_unregister_missing_connection_is_safe():
     manager = ConnectionManager()
 
-    manager.unregister(FakeConnection())
+    manager.unregister(FakeWebSocket())
 
     assert manager.active_connections == set()
 
 
-def test_send_personal():
+def test_send_personal_sends_text_and_bytes():
     manager = ConnectionManager()
-    connection = FakeConnection()
+    connection = FakeWebSocket()
 
-    asyncio.run(manager.send_personal("hello", connection))
+    async def run():
+        await manager.send_personal("hello", connection)
+        await manager.send_personal(b"\x00\x01", connection)
 
-    assert connection.sent == ["hello"]
+    asyncio.run(run())
+
+    assert connection.sent == ["hello", b"\x00\x01"]
 
 
-def test_broadcast_without_connections_does_nothing(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        broadcast_manager.websockets,
-        "broadcast",
-        lambda connections, message: calls.append((connections, message)),
-    )
+def test_broadcast_without_connections_does_nothing():
     manager = ConnectionManager()
 
-    manager.broadcast("hello")
+    async def run():
+        manager.broadcast({"type": "serial_data", "data": "hello"})
+        await manager.wait_for_pending()
 
-    assert calls == []
+    asyncio.run(run())
+
+    assert manager.active_connections == set()
+    assert manager._broadcast_tasks == set()
 
 
-def test_broadcast_sends_string(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        broadcast_manager.websockets,
-        "broadcast",
-        lambda connections, message: calls.append((connections, message)),
-    )
+def test_broadcast_sends_to_all_connections():
     manager = ConnectionManager()
-    connection = FakeConnection()
-    manager.register(connection)
-
-    manager.broadcast("hello")
-
-    assert calls[0][0] == {connection}
-    assert calls[0][1] == "hello"
-
-
-def test_broadcast_serializes_dict_as_json(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        broadcast_manager.websockets,
-        "broadcast",
-        lambda connections, message: calls.append(message),
-    )
-    manager = ConnectionManager()
-    manager.register(FakeConnection())
+    first = FakeWebSocket()
+    second = FakeWebSocket()
+    manager.register(first)
+    manager.register(second)
     message = {
         "type": "serial_data",
         "timestamp": "2026-01-01T12:00:00Z",
         "data": "hello",
     }
 
-    manager.broadcast(message)
+    async def run():
+        manager.broadcast(message)
+        await manager.wait_for_pending()
 
-    assert json.loads(calls[0]) == message
+    asyncio.run(run())
+
+    assert first.sent == [message]
+    assert second.sent == [message]
 
 
-def test_data_manager_sends_json_through_broadcast_manager(monkeypatch):
-    sent = []
-    monkeypatch.setattr(
-        broadcast_manager.websockets,
-        "broadcast",
-        lambda connections, message: sent.append(message),
-    )
+def test_failed_broadcast_unregisters_connection():
     manager = ConnectionManager()
-    manager.register(FakeConnection())
+    connection = FakeWebSocket(fail=True)
+    manager.register(connection)
+
+    async def run():
+        manager.broadcast({"type": "serial_data", "data": "hello"})
+        await manager.wait_for_pending()
+
+    asyncio.run(run())
+
+    assert connection not in manager.active_connections
+
+
+def test_data_manager_sends_message_through_broadcast_manager():
+    manager = ConnectionManager()
+    connection = FakeWebSocket()
+    manager.register(connection)
     data_manager = DataManager(broadcast_manager=manager)
     timestamp = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
-    message = data_manager.handle_line("hello\r\n", timestamp)
+    async def run():
+        message = data_manager.handle_line("hello\r\n", timestamp)
+        await manager.wait_for_pending()
+        return message
 
-    assert json.loads(sent[0]) == message
+    message = asyncio.run(run())
 
-
-def test_handler_registers_broadcasts_and_unregisters(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        broadcast_manager.websockets,
-        "broadcast",
-        lambda connections, message: calls.append((set(connections), message)),
-    )
-    manager = ConnectionManager()
-    monkeypatch.setattr(broadcast_manager, "manager", manager)
-    connection = FakeConnection(messages=["one", "two"])
-
-    asyncio.run(broadcast_manager.handler(connection))
-
-    assert calls == [
-        ({connection}, "User says: one"),
-        ({connection}, "User says: two"),
-    ]
-    assert manager.active_connections == set()
+    assert connection.sent == [message]
