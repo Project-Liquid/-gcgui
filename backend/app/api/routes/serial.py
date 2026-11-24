@@ -1,13 +1,34 @@
+import logging
+
 from fastapi import APIRouter, Body, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.hardware.serial_manager import SerialManager
+from app.services.broadcast_manager import manager as broadcast_manager
+from app.services.data_manager import data_manager, make_serial_status_message
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/serial", tags=["serial"])
 
+
+def _publish_serial_status(serial_status: dict) -> None:
+    """Broadcast a serial connection change to every connected browser."""
+    broadcast_manager.broadcast(make_serial_status_message(**serial_status))
+
+
 # One manager for the whole process. Later routes should reuse this object so
-# they all talk to the same physical serial port.
-serial_manager = SerialManager()
+# they all talk to the same physical serial port. Incoming lines are handed to
+# the shared data manager, which records and broadcasts them.
+serial_manager = SerialManager(
+    on_line=data_manager.handle_line,
+    on_status=_publish_serial_status,
+)
+
+
+def serial_status_message() -> dict:
+    """Return the current serial state as a WebSocket message."""
+    return make_serial_status_message(**serial_manager.status())
 
 
 class ConnectRequest(BaseModel):
@@ -51,6 +72,12 @@ def get_status() -> bool:
     return serial_manager.is_open()
 
 
+@router.get("/info")
+def get_info() -> dict:
+    """Return connection details for the frontend status display."""
+    return serial_manager.status()
+
+
 @router.post("/connect")
 def connect(request: ConnectRequest) -> ConnectResponse:
     "attempts a connection to a port"
@@ -58,10 +85,12 @@ def connect(request: ConnectRequest) -> ConnectResponse:
         request.port, request.baudrate, request.timeout
     )
     if connection is None:
+        logger.warning("Could not connect to serial port %s", request.port)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Failed to connect to {request.port}",
         )
+    logger.info("Connected to serial port %s at %s baud", request.port, request.baudrate)
     return ConnectResponse(
         connected=True,
         port=request.port,

@@ -122,3 +122,12 @@ def test_handle_line_broadcasts_each_line_separately():
     manager.handle_line("two\n")
 
     assert [message["data"] for message in broadcaster.messages] == ["one", "two"]
+
+
+def test_handle_line_can_skip_recording_for_replay():
+    recorder = FakeRecorder(recording=True)
+    manager = DataManager(recording_manager=recorder)
+
+    manager.handle_line("replayed\r\n", record=False)
+
+    assert recorder.lines == []

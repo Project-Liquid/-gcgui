@@ -3,6 +3,8 @@
 These tests use mocks, so they do not need a real serial device attached.
 """
 
+import threading
+import time
 from unittest.mock import MagicMock, call
 
 import serial
@@ -116,7 +118,7 @@ def test_connect_serial_closes_previous_connection_before_reconnecting(monkeypat
     assert manager.ser is new
 
 
-def test_connect_serial_returns_none_and_reports_failure(monkeypatch, capsys):
+def test_connect_serial_returns_none_and_reports_failure(monkeypatch, caplog):
     manager = make_manager()
     monkeypatch.setattr(
         serial_manager.serial,
@@ -125,11 +127,11 @@ def test_connect_serial_returns_none_and_reports_failure(monkeypatch, capsys):
     )
 
     assert manager.connect_serial("/dev/ttyUSB0") is None
-    assert "Failed to connect to /dev/ttyUSB0" in capsys.readouterr().out
+    assert "Failed to connect to /dev/ttyUSB0" in caplog.text
     assert manager.is_open() is False
 
 
-def test_connect_serial_returns_none_for_invalid_settings(monkeypatch, capsys):
+def test_connect_serial_returns_none_for_invalid_settings(monkeypatch, caplog):
     manager = make_manager()
     monkeypatch.setattr(
         serial_manager.serial,
@@ -138,7 +140,7 @@ def test_connect_serial_returns_none_for_invalid_settings(monkeypatch, capsys):
     )
 
     assert manager.connect_serial("COM1", baudrate=-1) is None
-    assert "Failed to connect to COM1" in capsys.readouterr().out
+    assert "Failed to connect to COM1" in caplog.text
 
 
 def test_connect_serial_closes_connection_that_did_not_open(monkeypatch):
@@ -263,3 +265,110 @@ def test_fread_returns_none_when_port_is_closed():
 
     assert manager.fread() is None
     ser.read_all.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Background reader and status callbacks
+# ---------------------------------------------------------------------------
+
+
+class ReadablePort:
+    """Small stand-in for a pyserial port that yields queued lines."""
+
+    def __init__(self, lines=None, error=None):
+        self.lines = list(lines or [])
+        self.error = error
+        self.is_open = True
+        self._closed = threading.Event()
+
+    def readline(self):
+        while self.is_open:
+            if self.error is not None:
+                raise self.error
+            if self.lines:
+                return self.lines.pop(0)
+            self._closed.wait(0.005)
+        return b""
+
+    def close(self):
+        self.is_open = False
+        self._closed.set()
+
+
+def wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_reader_passes_each_line_to_callback(monkeypatch):
+    port = ReadablePort([b"first\n", b"second\r\n"])
+    lines = []
+    received = threading.Event()
+
+    def on_line(line):
+        lines.append(line)
+        if len(lines) == 2:
+            received.set()
+
+    manager = SerialManager(on_line=on_line)
+    monkeypatch.setattr(serial_manager.serial, "Serial", MagicMock(return_value=port))
+
+    assert manager.connect_serial("/dev/fake") is port
+    assert received.wait(2.0)
+    manager.disconnect()
+
+    assert lines == ["first\n", "second\r\n"]
+
+
+def test_reader_reports_disconnect_on_read_error(monkeypatch):
+    port = ReadablePort(error=serial.SerialException("device unplugged"))
+    statuses = []
+
+    manager = SerialManager(on_line=lambda line: None, on_status=statuses.append)
+    monkeypatch.setattr(serial_manager.serial, "Serial", MagicMock(return_value=port))
+
+    assert manager.connect_serial("/dev/fake") is port
+    assert wait_until(lambda: len(statuses) >= 2)
+
+    assert statuses[0]["connected"] is True
+    assert statuses[-1]["connected"] is False
+    assert "device unplugged" in statuses[-1]["error"]
+    assert manager.is_open() is False
+
+
+def test_connect_ignores_duplicate_request_for_same_open_port(monkeypatch):
+    port = ReadablePort()
+    constructor = MagicMock(return_value=port)
+    manager = SerialManager()
+    monkeypatch.setattr(serial_manager.serial, "Serial", constructor)
+
+    first = manager.connect_serial("/dev/fake", baudrate=115200)
+    second = manager.connect_serial("/dev/fake", baudrate=115200)
+
+    assert first is port
+    assert second is port
+    assert constructor.call_count == 1
+    manager.disconnect()
+
+
+def test_status_callback_receives_details(monkeypatch):
+    port = ReadablePort()
+    statuses = []
+
+    manager = SerialManager(on_status=statuses.append)
+    monkeypatch.setattr(serial_manager.serial, "Serial", MagicMock(return_value=port))
+
+    manager.connect_serial("/dev/fake", baudrate=9600)
+    manager.disconnect()
+
+    assert statuses[0] == {
+        "connected": True,
+        "port": "/dev/fake",
+        "baud_rate": 9600,
+        "error": None,
+    }
+    assert statuses[-1]["connected"] is False

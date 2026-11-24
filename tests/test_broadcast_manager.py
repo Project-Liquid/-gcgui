@@ -124,3 +124,18 @@ def test_data_manager_sends_message_through_broadcast_manager():
     message = asyncio.run(run())
 
     assert connection.sent == [message]
+
+
+def test_broadcast_from_worker_thread_reaches_clients():
+    manager = ConnectionManager()
+    connection = FakeWebSocket()
+    message = {"type": "serial_data", "timestamp": "2026-01-01T12:00:00Z", "data": "hi"}
+
+    async def run():
+        manager.register(connection)
+        await asyncio.to_thread(manager.broadcast, message)
+        await manager.wait_for_pending()
+
+    asyncio.run(run())
+
+    assert connection.sent == [message]

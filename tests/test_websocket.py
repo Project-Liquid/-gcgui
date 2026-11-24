@@ -14,8 +14,18 @@ def test_websocket_sends_hello_message():
     assert message == {"type": "hello", "message": "WebSocket connected"}
 
 
+def test_websocket_sends_initial_serial_status():
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+        message = websocket.receive_json()
+
+    assert message["type"] == "serial_status"
+    assert message["connected"] is False
+
+
 def test_websocket_answers_ping():
     with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
         websocket.receive_json()
         websocket.send_text("ping")
 

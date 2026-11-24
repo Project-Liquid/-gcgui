@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.api.routes.serial import serial_status_message
 from app.services.broadcast_manager import manager
 
 router = APIRouter()
@@ -15,6 +16,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await manager.send_personal(
         {"type": "hello", "message": "WebSocket connected"}, websocket
     )
+    await manager.send_personal(serial_status_message(), websocket)
     try:
         while True:
             message = await websocket.receive_text()
